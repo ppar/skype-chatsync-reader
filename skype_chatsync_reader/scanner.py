@@ -13,7 +13,7 @@ from struct import unpack, calcsize
 from collections import namedtuple
 from datetime import datetime
 import warnings
-import os.path
+import os
 from glob import glob
 
 
@@ -213,6 +213,19 @@ class SkypeChatSyncScanner(object):
 ConversationMessage = namedtuple('ConversationMessage', 'timestamp author text is_edit')
 
 class SkypeChatSyncParser(object):
+    """Represents data parsed from a single .dat file.
+
+    Fields:
+       is_empty       Bool
+       timestamp      UNIX timestamp
+       conversation   A list of ConversationMessage tuples
+       participants   List containing 2 participants' userids (parsed from ....)
+       peers          List containing all participants' userids (parsed from
+                      .participants and .conversation[].author)
+
+    As far as multi-user chats are recognized, .peers contains ids of all users in the chat.
+    """
+
     def __init__(self, scanner):
         self.scanner = scanner
     
@@ -263,6 +276,188 @@ class SkypeChatSyncParser(object):
                 self.conversation.append(ConversationMessage(msg.header.timestamp, participant1 if user_id == user1_id else participant2, unicode(msg_text, 'utf-8'), is_edit))
             except:
                 self.errors += 1
+
+        self.parse_peers()
+
+    def parse_peers(self):
+        peer_set = set()
+
+        for username in self.participants:
+            peer_set.add(username)
+
+        for msg in self.conversation:
+            peer_set.add(msg.author)
+
+        if len(peer_set) == 0:
+            peer_set.add('__UNKNOWN__')
+
+        self.peers = list(peer_set)
+
+class AbstractChatHistory(object):
+    """Common methods for ThreadedSkypeChatHistory and FlatSkypeChatHistory"""
+
+    # Input parameters
+    my_username     = None
+    username_filter = None
+    timestamp_from  = None
+    timestamp_to    = None
+
+    def __init__(self, my_username, username_filter=None, timestamp_from=None, timestamp_to=None):
+        """Constructor method. Messages are filtered by username_filter, timestamp_from and timestamp_to if any are set"""
+
+        self.my_username     = my_username
+        self.username_filter = username_filter
+        self.timestamp_from  = timestamp_from
+        self.timestamp_to    = timestamp_to
+
+    def import_directory(self, srcdir):
+        """Scans directory srcdir recursively for .dat files and imports their contents."""
+
+        errors = []
+
+        # Iterate directories
+        for root, dirs, files in os.walk(srcdir):
+            # Iterate files in directory
+            for filename in files:
+                # Only consider *.dat files
+                if filename[-4:] != ".dat":
+                    continue
+
+                # Skip OS X's "._*" metadata files
+                if filename[:2] == "._":
+                    continue
+
+                # Parse the file
+
+                with open(root + "/" + filename, 'rb') as filehandle:
+                    try:
+                        scanner = SkypeChatSyncScanner(filehandle)
+                        scanner.scan()
+                    except Exception as e:
+                        errors.append("Scan error: {}: {}".format(root + "/" + filename, e.message))
+                        continue
+
+                    try:
+                        parser = SkypeChatSyncParser(scanner)
+                        parser.parse()
+                    except Exception as e:
+                        errors.append("Parse error: {}: {}".format(root + "/" + filename, e.message))
+                        continue
+
+                # Import it
+                self.append_history(parser)
+
+        return errors
+
+    def check_username_filter(self, peer_set):
+        """Checks peer_set against self.userlist_filter"""
+
+        if self.username_filter == None:
+            return True
+
+        for username in self.username_filter:
+            if username in  peer_set:
+                return True
+
+        return False
+
+    def check_timestamp_filters(self, message):
+        """Checks message against timestamp filters"""
+
+        if self.timestamp_from != None:
+            if message.timestamp < self.timestamp_from:
+                return False
+
+        if self.timestamp_to != None:
+            if message.timestamp > self.timestamp_to:
+                return False
+
+        return True
+
+class ThreadedSkypeChatHistory(AbstractChatHistory):
+    """Represents a complete parsed chat history, sorted into threads according to participants
+
+    The .threads property is a dict containing the threads where the keys are frozenset()s
+    containing the usernames of this thread's members and the values are lists of
+    ConversationMessage tuples.
+    """
+
+    # Result: a {} of []s containing messages
+    threads = {}
+
+    def append_history(self, parser):
+        """Appends messages in /parser/ to this object. parser: a SkypeChatSyncParser that has had parse() called"""
+
+        #  p.timestamp, p.participants, and p.conversation
+
+        # Find out who we're talking with
+        peer_set = set(parser.peers)
+        if self.my_username in peer_set:
+            peer_set.remove(self.my_username)
+
+        # Apply peer filter list
+        if not self.check_username_filter(peer_set):
+            return
+
+        # frozensets can be used as keys
+        peer_set = frozenset(peer_set)
+
+        if peer_set not in self.threads:
+            self.threads[peer_set] = []
+
+        for message in parser.conversation:
+            # Apply timestamp filters
+            if not self.check_timestamp_filters(message):
+                continue
+
+            self.threads[peer_set].append(message)
+
+    def clean_threads(self):
+        """Removes empty threads"""
+
+        new_threads = {}
+        for peer_set in self.threads:
+            if len(self.threads[peer_set]) > 0:
+                new_threads[peer_set] = self.threads[peer_set]
+
+        self.threads = new_threads
+
+    def sort_threads(self):
+        """Sorts each thread the .threads property according to timestamp"""
+        for peer_set in self.threads:
+            self.threads[peer_set] = sorted(self.threads[peer_set], key = lambda ts: ts.timestamp)
+
+
+class FlatSkypeChatHistory(AbstractChatHistory):
+    """Represents a complete parsed chat history without threads"""
+
+    # Result: a [] of messages
+    messages = []
+
+    def append_history(self, parser):
+        """Appends messages in /parser/ to this object. parser: a SkypeChatSyncParser that has had parse() called"""
+
+        #  p.timestamp, p.participants, and p.conversation
+
+        # Find out who we're talking with
+        peer_set = set(parser.peers)
+        if self.my_username in peer_set:
+            peer_set.remove(self.my_username)
+
+        # Apply peer filter list
+        if not self.check_username_filter(peer_set):
+            return
+
+        for message in parser.conversation:
+            # Apply timestamp filters
+            if not self.check_timestamp_filters(message):
+                continue
+
+            self.messages.append(message)
+
+    def sort_messages(self):
+        """Sorts messages according to timestamp"""
+        self.messages = sorted(self.messages, key = lambda ts: ts.timestamp)
 
 
 def parse_chatsync_file(filename):
