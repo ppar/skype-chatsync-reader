@@ -16,15 +16,32 @@ import warnings
 import os
 from glob import glob
 
-
 class ScanException(Exception):
     def __init__(self, message):
         super(ScanException, self).__init__(message)
 
+#
+# The FileHeader, BlockHeader and MessageHeader classes represent binary
+# structures within the .dat file.
+#
+# The __format___ property descibes the data types found in the binary
+# file and each field's byte sizes - https://docs.python.org/2/library/struct.html
+#
 
 class FileHeader(namedtuple('FileHeader', 'signature timestamp data_size padding')):
+    """Represents the .dat file's main header - first 32 bytes
+
+        FMT  TYPE            SIZE (b)    USE
+        <    little-endian   -           -
+        5s   5 x char[]      5x1         0x73; 0x43; 0x64; 0x72; 0x07 in ASCII terms "sCdB(bell)"
+        I    unsigned int    4           4 bytes: unsigned int, unix timestamp
+        I    unsigned int    4           4 or more bytes: unsigned int; total data size after header (filesize - 32)
+        19s  19 x char[]     19          N bytes padding
+    """
     __format__ = '<5sII19s'
+
     def validate(self, scanner):
+        """Validates the read data"""
         if self.signature != 'sCdB\x07':
             raise ScanException("Error scanning header in %s. Invalid signature: %s." % (scanner.name, self.signature))
         if self.padding != '\x00'*19:
@@ -34,7 +51,22 @@ class FileHeader(namedtuple('FileHeader', 'signature timestamp data_size padding
 Block = namedtuple ('Block', 'block_header block_data')
 
 class BlockHeader(namedtuple('BlockHeader', 'data_size x type padding')):
+    """Represents a "block header" in the .dat file - 16 bytes.
+
+       .dat files contain 6 major blocks of data enumerated #1 - #6. Each of them has a standard header:
+
+        FMT  TYPE            SIZE (b)    USE
+        <    little-endian   -           -
+        I    unsigned int    4           4 bytes: unsigned int; block data size (in bytes)
+        I    unsigned int    4           4 bytes: unknown id
+        I    unsigned int    4           4 bytes: unsigned int; block number/descriptor (1,2,3,4,5 or 6)
+        4s   5 x char[]      4           4 bytes padding
+
+        Each major block, according to it's descriptor (1-6) has different internal data structure,
+        these are represented by <......> below.
+    """
     __format__ = '<III4s'
+
     def validate(self, scanner):
         if self.padding != '\x00'*4:
             warnings.warn("Block #%d header padding not all zeroes in %s." % (len(scanner.blocks) + 1, scanner.name))
@@ -45,6 +77,9 @@ class BlockHeader(namedtuple('BlockHeader', 'data_size x type padding')):
 Message = namedtuple('Message', 'header records')
 
 class MessageHeader(namedtuple('MessageHeader', 'id x timestamp y data_size')):
+    """Represents a binary structure within the .dat file"""
+
+    # little-endian, 5x unsigned int
     __format__ = '<5I'
     def validate(self, scanner):
         pass
@@ -61,19 +96,46 @@ class Field(namedtuple('Field', 'type code value')):
 
 
 class SkypeChatSyncScanner(object):
+
+    # Internal properties:
+    #
+    # input         File         Input file
+    # name          string       Name/descr of the input file
+    # file_header   FileHeader   The main header
+    #
+
+    # Scanned data is made available in properties:
+    #
+    # timestamp     datetime     The timestamp read from the file's main header
+    # warnings      int          Nr of warnings
+    # blocks        []
+
     def __init__(self, file_like_object, name=None):
+        """Constructor method.
+           file_like_object:   File handle to the input file
+           name:               Optional name/description of the input file
+        """
         self.input = file_like_object
         self.name = name if name is not None else repr(self.input)
 
     def scan(self):
+        """Scans the input file. Only "public" method apart from __init__ ."""
+
+        # Read in the file's main header
         size, self.file_header = self.scan_struct(FileHeader)
         self.timestamp = datetime.fromtimestamp(self.file_header.timestamp)
+
         self.warnings = 0
         self.blocks = []
+
+        # Read in each of the file's major blocks
         size, self.blocks = self.scan_sequence(self.scan_block, self.file_header.data_size)
-        self.validate()
         
+        # Validate the whole thing.
+        self.validate()
+
     def validate(self):
+        """Validates the whole /self/ object after scanning is complete"""
         if len(self.blocks) != 6:
             warnings.warn("Incorrect number of blocks (%d) read from %s." % (len(self.blocks), self.name))
             self.warnings += 1
@@ -82,11 +144,18 @@ class SkypeChatSyncScanner(object):
             if sorted(block_ids) != range(1, 7):
                 warnings.warn("Not all blocks 1..6 are present in %s." % self.name)
                 self.warnings += 1
+
         block_6 = [b for b in self.blocks if b.block_header.type == 6]
+
         if len(block_6) != 1:
             raise ScanException("Block 6 not found, or more than one found in file %s." % self.name)
         
     def scan_sequence(self, method, nbytes, stop_at=lambda x: False):
+        """Calls the data type-specific scanner method /method/ sequentially until /nbytes/ bytes
+           have been read from the input file or .....
+
+           Returns (<the number of bytes left unread>, <a [] of items returned by /method/>)
+        """
         items = []
         remaining = nbytes
         while remaining > 0:
@@ -101,6 +170,14 @@ class SkypeChatSyncScanner(object):
         return nbytes - remaining, items
         
     def scan_struct(self, cls):
+        """Reads a fixed number of bytes from the input file and interprets the data based on 
+           the class /cls/, which is one of the binary strcut-describing classes (FileHeader, 
+           BlockHeader, MessageHeader). 
+
+           Creates an object of the specified class and calls the class's validate() method.
+
+           Returns (<nr of bytes read>, <the created object).
+        """
         size = calcsize(cls.__format__)
         data = self.input.read(size)
         if len(data) != size:
@@ -110,6 +187,10 @@ class SkypeChatSyncScanner(object):
         return size, result
     
     def scan_block(self, nbytes):
+        """Scanner callback for scan_sequence(). Scans a top-level data block header and branches to 
+           scan the block-type-specific data following it.
+
+           Returns (<nr of bytes read>, <Block object containing the block header and data>)"""
         hsize, block_header = self.scan_struct(BlockHeader)
         dsize, block_data = self.scan_block_data(block_header)
         return hsize + dsize, Block(block_header, block_data)
@@ -120,18 +201,59 @@ class SkypeChatSyncScanner(object):
         elif block_header.type == 6:
             return self.scan_block_6_data(block_header)
         else:
-            return self.scan_block_1_data(block_header)
+            return self.scan_block_1234_data(block_header)
     
-    def scan_block_1_data(self, block_header):
+    def scan_block_1234_data(self, block_header):
+        """Scans a "type 1/2/3/4" block. 
+
+           These blocks share common internal structure: a collection of "variable clusters" 
+           (records). That is sequence of DBB variables in separate sub-blocks. Each "variable 
+           cluster" has the structure
+
+           byte 0x41 "A"
+           byte N 
+           --
+           --
+           DBB variables
+           --
+           --
+           ( end of record )
+
+
+           DBB variables:
+
+           - All content begins with 0x03. Read the data until you hit an 0x03. This does not 
+           need to be on the even byte offset!
+
+           - If the byte is a 0x03, then it is followed by a number. Numbers are in a 7-bit format. 
+           The MSB identifies whether it is the last byte in the number sequence. (If the MSB is 
+           set (Byte & 0x80), then it is not the last byte in the number. If the MSB is clear, 
+           then it is the last byte in the number.) This number identifies the TYPE of the data field.
+
+           - All bytes after the type are the data for the field.
+
+           - All data sections end with 0x00, 0x01, 0x02, or 0x03. If it is 0x03, then it denotes a 
+           new dataset immediately after the last data set. Process this next set of data. If it 
+           is 0x00, then the next bytes are junk. Read until you hit another 0x03.
+        """
         return self.scan_sequence(self.scan_record, block_header.data_size)
 
     def scan_block_5_data(self, block_header):
+        """Scans a "type 5" block (blocks?).
+
+           "[Block type 5] is just a collection of 16byte records, containng four 4-byte integer values, 
+            which represent message id (as insert into main.dbb or DBB), message handles (relating to 
+            block #6) and a field i have no clue about. Data is aligned, so reading sequence of 32bit 
+            integers is straight-forward."
+        """
         return block_header.data_size, [unpack('<4I', self.input.read(16)) for i in range(block_header.data_size/16)]
 
     def scan_block_6_data(self, block_header):
+        """Scans a sequence of "type 6" blocks, i.e. messages"""
         return self.scan_sequence(self.scan_message, block_header.data_size)
         
     def scan_record(self, nbytes):
+        """Scanner callback for scan_sequence(), utilized by scan_block_1234_data() and scan_message()."""
         signature = self.input.read(1)
         if (signature != 'A'):
             raise ScanException("Record expected to start with 'A' in %s." % self.name)
@@ -143,6 +265,8 @@ class SkypeChatSyncScanner(object):
             return size + 2, Record(n, fields)
     
     def scan_field(self, nbytes):
+        """Scanner callback for scan_sequence(), utilized by scan_record()"""
+
         type = ord(self.input.read(1))
         if type == Field.INT:
             csize, code = self.scan_7bitint()
@@ -173,6 +297,7 @@ class SkypeChatSyncScanner(object):
         return csize + vsize + 1, Field(type, code, value)
 
     def scan_message(self, nbytes):
+        """Scanner callback for scan_sequence(), utilized by scan_block_6_data()"""
         hsize, header = self.scan_struct(MessageHeader)
         rsize, records = self.scan_sequence(self.scan_record, header.data_size)
         return hsize + rsize, Message(header, records)
@@ -334,20 +459,33 @@ class AbstractChatHistory(object):
                         scanner = SkypeChatSyncScanner(filehandle)
                         scanner.scan()
                     except Exception as e:
-                        errors.append("Scan error: {}: {}".format(root + "/" + filename, e.message))
+                        errors.append("Scan error, skipping: {}: {}".format(root + "/" + filename, e.message))
                         continue
 
                     try:
                         parser = SkypeChatSyncParser(scanner)
                         parser.parse()
                     except Exception as e:
-                        errors.append("Parse error: {}: {}".format(root + "/" + filename, e.message))
+                        errors.append("Parse error, skipping: {}: {}".format(root + "/" + filename, e.message))
                         continue
+
 
                 # Import it
                 self.append_history(parser)
 
         return errors
+
+    def import_file(self, filename):
+        """Imports a single file. Raises exceptions if things fail."""
+
+        with open(filename, 'rb') as filehandle:
+            scanner = SkypeChatSyncScanner(filehandle)
+            scanner.scan()
+
+            parser = SkypeChatSyncParser(scanner)
+            parser.parse()
+
+            self.append(perser)
 
     def check_username_filter(self, peer_set):
         """Checks peer_set against self.userlist_filter"""
