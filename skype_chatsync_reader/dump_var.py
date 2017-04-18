@@ -1,7 +1,11 @@
+"""
+Yet another ad hoc variable dumper a la PHP's var_dump()
+
+Copyright 2017, Peter Parkkali
+MIT License.
+"""
+
 def dump_var(var, level = 0, _var_index = None):
-    """
-        Yet another ad hoc variable dumper a la PHP's var_dump()
-    """
 
     PAD = "  "
     MAX_WIDTH = 180

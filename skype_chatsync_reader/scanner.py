@@ -5,16 +5,21 @@ Format as described by kmn in http://www.hackerfactor.com/blog/index.php?/archiv
 As the format specification used is not official and incomplete, the parser is limited in what it can do.
 It may fail on some files, and on other files will only be able to extract messages partially.
 
-Copyright 2015, Konstantin Tretyakov.
+Copyright 2015, Konstantin Tretyakov; 2017, Peter Parkkali
 MIT License.
+
+Portions of file format descriptions are from abovementioned blog article.
 '''
 
 from struct import unpack, calcsize
 from collections import namedtuple
 from datetime import datetime
+from glob import glob
 import warnings
 import os
-from glob import glob
+import re
+
+from dump_var import dump_var
 
 class ScanException(Exception):
     def __init__(self, message):
@@ -45,7 +50,7 @@ class FileHeader(namedtuple('FileHeader', 'signature timestamp data_size padding
         if self.signature != 'sCdB\x07':
             raise ScanException("Error scanning header in %s. Invalid signature: %s." % (scanner.name, self.signature))
         if self.padding != '\x00'*19:
-            warnings.warn("Header padding not all zeroes in %s." % scanner.name)        
+            warnings.warn("Header padding not all zeroes in %s." % scanner.name)
             scanner.warnings += 1
 
 Block = namedtuple ('Block', 'block_header block_data')
@@ -130,7 +135,7 @@ class SkypeChatSyncScanner(object):
 
         # Read in each of the file's major blocks
         size, self.blocks = self.scan_sequence(self.scan_block, self.file_header.data_size)
-        
+
         # Validate the whole thing.
         self.validate()
 
@@ -149,7 +154,7 @@ class SkypeChatSyncScanner(object):
 
         if len(block_6) != 1:
             raise ScanException("Block 6 not found, or more than one found in file %s." % self.name)
-        
+
     def scan_sequence(self, method, nbytes, stop_at=lambda x: False):
         """Calls the data type-specific scanner method /method/ sequentially until /nbytes/ bytes
            have been read from the input file or .....
@@ -168,11 +173,11 @@ class SkypeChatSyncScanner(object):
             warnings.warn("Invalid data size detected during sequence parsing in %s." % self.name)
             self.warnings += 1
         return nbytes - remaining, items
-        
+
     def scan_struct(self, cls):
-        """Reads a fixed number of bytes from the input file and interprets the data based on 
-           the class /cls/, which is one of the binary strcut-describing classes (FileHeader, 
-           BlockHeader, MessageHeader). 
+        """Reads a fixed number of bytes from the input file and interprets the data based on
+           the class /cls/, which is one of the binary strcut-describing classes (FileHeader,
+           BlockHeader, MessageHeader).
 
            Creates an object of the specified class and calls the class's validate() method.
 
@@ -185,16 +190,16 @@ class SkypeChatSyncScanner(object):
         result = cls._make(unpack(cls.__format__, data))
         result.validate(self)
         return size, result
-    
+
     def scan_block(self, nbytes):
-        """Scanner callback for scan_sequence(). Scans a top-level data block header and branches to 
+        """Scanner callback for scan_sequence(). Scans a top-level data block header and branches to
            scan the block-type-specific data following it.
 
            Returns (<nr of bytes read>, <Block object containing the block header and data>)"""
         hsize, block_header = self.scan_struct(BlockHeader)
         dsize, block_data = self.scan_block_data(block_header)
         return hsize + dsize, Block(block_header, block_data)
-        
+
     def scan_block_data(self, block_header):
         if block_header.type == 5:
             return self.scan_block_5_data(block_header)
@@ -202,16 +207,16 @@ class SkypeChatSyncScanner(object):
             return self.scan_block_6_data(block_header)
         else:
             return self.scan_block_1234_data(block_header)
-    
-    def scan_block_1234_data(self, block_header):
-        """Scans a "type 1/2/3/4" block. 
 
-           These blocks share common internal structure: a collection of "variable clusters" 
-           (records). That is sequence of DBB variables in separate sub-blocks. Each "variable 
+    def scan_block_1234_data(self, block_header):
+        """Scans a "type 1/2/3/4" block.
+
+           These blocks share common internal structure: a collection of "variable clusters"
+           (records). That is sequence of DBB variables in separate sub-blocks. Each "variable
            cluster" has the structure
 
            byte 0x41 "A"
-           byte N 
+           byte N
            --
            --
            DBB variables
@@ -222,18 +227,18 @@ class SkypeChatSyncScanner(object):
 
            DBB variables:
 
-           - All content begins with 0x03. Read the data until you hit an 0x03. This does not 
+           - All content begins with 0x03. Read the data until you hit an 0x03. This does not
            need to be on the even byte offset!
 
-           - If the byte is a 0x03, then it is followed by a number. Numbers are in a 7-bit format. 
-           The MSB identifies whether it is the last byte in the number sequence. (If the MSB is 
-           set (Byte & 0x80), then it is not the last byte in the number. If the MSB is clear, 
+           - If the byte is a 0x03, then it is followed by a number. Numbers are in a 7-bit format.
+           The MSB identifies whether it is the last byte in the number sequence. (If the MSB is
+           set (Byte & 0x80), then it is not the last byte in the number. If the MSB is clear,
            then it is the last byte in the number.) This number identifies the TYPE of the data field.
 
            - All bytes after the type are the data for the field.
 
-           - All data sections end with 0x00, 0x01, 0x02, or 0x03. If it is 0x03, then it denotes a 
-           new dataset immediately after the last data set. Process this next set of data. If it 
+           - All data sections end with 0x00, 0x01, 0x02, or 0x03. If it is 0x03, then it denotes a
+           new dataset immediately after the last data set. Process this next set of data. If it
            is 0x00, then the next bytes are junk. Read until you hit another 0x03.
         """
         return self.scan_sequence(self.scan_record, block_header.data_size)
@@ -241,9 +246,9 @@ class SkypeChatSyncScanner(object):
     def scan_block_5_data(self, block_header):
         """Scans a "type 5" block (blocks?).
 
-           "[Block type 5] is just a collection of 16byte records, containng four 4-byte integer values, 
-            which represent message id (as insert into main.dbb or DBB), message handles (relating to 
-            block #6) and a field i have no clue about. Data is aligned, so reading sequence of 32bit 
+           "[Block type 5] is just a collection of 16byte records, containng four 4-byte integer values,
+            which represent message id (as insert into main.dbb or DBB), message handles (relating to
+            block #6) and a field i have no clue about. Data is aligned, so reading sequence of 32bit
             integers is straight-forward."
         """
         return block_header.data_size, [unpack('<4I', self.input.read(16)) for i in range(block_header.data_size/16)]
@@ -251,7 +256,7 @@ class SkypeChatSyncScanner(object):
     def scan_block_6_data(self, block_header):
         """Scans a sequence of "type 6" blocks, i.e. messages"""
         return self.scan_sequence(self.scan_message, block_header.data_size)
-        
+
     def scan_record(self, nbytes):
         """Scanner callback for scan_sequence(), utilized by scan_block_1234_data() and scan_message()."""
         signature = self.input.read(1)
@@ -263,7 +268,7 @@ class SkypeChatSyncScanner(object):
         else:
             size, fields = self.scan_sequence(self.scan_field, nbytes-2, lambda f: f.type == Field.END_OF_RECORD)
             return size + 2, Record(n, fields)
-    
+
     def scan_field(self, nbytes):
         """Scanner callback for scan_sequence(), utilized by scan_record()"""
 
@@ -301,7 +306,7 @@ class SkypeChatSyncScanner(object):
         hsize, header = self.scan_struct(MessageHeader)
         rsize, records = self.scan_sequence(self.scan_record, header.data_size)
         return hsize + rsize, Message(header, records)
-    
+
     def scan_7bitint(self):
         result = 0
         coef = 1
@@ -320,7 +325,7 @@ class SkypeChatSyncScanner(object):
             coef <<= 7
             size += 1
         return size, result
-            
+
     def scan_cstring(self):
         result = ''
         c = self.input.read(1)
@@ -328,86 +333,318 @@ class SkypeChatSyncScanner(object):
             result += c
             c = self.input.read(1)
         return len(result) + 1, result
-    
+
     def scan_blob(self):
         sizesize, size = self.scan_7bitint()
         data = self.input.read(size)
         return sizesize + len(data), data
-        
+
 
 ConversationMessage = namedtuple('ConversationMessage', 'timestamp author text is_edit')
 
 class SkypeChatSyncParser(object):
     """Represents data parsed from a single .dat file.
 
-    Fields:
-       is_empty       Bool
-       timestamp      UNIX timestamp
-       conversation   A list of ConversationMessage tuples
-       participants   List containing 2 participants' userids (parsed from ....)
-       peers          List containing all participants' userids (parsed from
-                      .participants and .conversation[].author)
+    After calling .parse(), data is available in fields:
+
+    is_empty                Bool
+    timestamp               UNIX timestamp from the file's main header
+    conversation            A list of ConversationMessage tuples
+
+    session_id              Session id of the form '#username_1/$username_2;6a2b3ce00f8123ca'
+    session['caller']       Caller's username parsed from session_id
+    session['recipient']    Receipient's username parsed from session_id
+    session['connection_id'] Connection ID parsed from session_id
+    participants[0]         An alias of session.caller
+    participants[1]         An alias of session.recipient
+
+    peers                   List containing all participants' userids found in the file
+
 
     As far as multi-user chats are recognized, .peers contains ids of all users in the chat.
     """
 
     def __init__(self, scanner):
         self.scanner = scanner
-    
+
     def parse(self):
         self.timestamp = self.scanner.file_header.timestamp
         self.conversation = []
         self.errors = 0
         self.is_empty = False
-        if (len(self.scanner.blocks) == 0 or len(self.scanner.blocks[0].block_data) == 0 or len(self.scanner.blocks[0].block_data[0].fields) == 0):
+        self.user_name_map = {}
+
+        if (len(self.scanner.blocks) == 0
+                or len(self.scanner.blocks[0].block_data) == 0
+                or len(self.scanner.blocks[0].block_data[0].fields) == 0):
             self.is_empty = True
             return
-        participants = self.scanner.blocks[0].block_data[0].fields[0].value
-        participants = participants.split(';')[0]
-        participant1, participant2 = [name[1:] for name in participants.split('/')]
-        self.participants = [participant1, participant2]
-        
-        # Find the first message with two parts - there we'll be able to detect the ID of the author of the conversation
+
+        # Parse the session id
+        # [value] <str(41)> '#username_1/$username_2;6a2b3ce00f8123ca'
+        self.session_id = self.scanner.blocks[0].block_data[0].fields[0].value
+        matches = re.match('^\#([^/]+)/\$([^;]+);(.*)', self.session_id)
+        if not matches:
+            raise ScanException("Could not parse session id - RE did not match: '{}'".format(self.session_id))
+        self.session = {
+            "caller": matches.group(1),
+            "recipient": matches.group(2),
+            "connection_id": matches.group(3)
+        }
+        self.participants = [self.session['caller'], self.session['recipient']]
+
+        # Parse all "Type 2" blocks for usernames
+        for block_index, block in enumerate(self.scanner.blocks):
+            if block.block_header.type == 2:
+                self.parse_blocktype_2(block_index)
+
+        # Parse all "Type 6" blocks for usernames
+        for block_index, block in enumerate(self.scanner.blocks):
+            if block.block_header.type == 6:
+                self.parse_blocktype_6_usernames(block_index)
+
+        # Parse all "Type 6" blocks for messages
+        for block_index, block in enumerate(self.scanner.blocks):
+            if block.block_header.type == 6:
+                self.parse_blocktype_6_messages(block_index)
+        #
+        self.parse_peers()
+
+    def parse_blocktype_2(self, block_index):
+        """Parses a type-2 block and looks for user id => user name mappings"""
+
+        #    [5] <Tuple:Record>
+        #        [n] <int> 6
+        #        [fields] <list>
+        #          [0] <Tuple:Field>
+        #            [type] <int> 0
+        #            [code] <int> 2
+        #            [value] <int> XXXXXX
+        #          [1] <Tuple:Field>
+        #            [type] <int> 0
+        #            [code] <int> 3
+        #            [value] <int> NNNNNNNNN		// USER ID
+        #          [2] <Tuple:Field>
+        #            [type] <int> 4
+        #            [code] <int> 4
+        #            [value] <str(179)> '.........'
+        #          [3] <Tuple:Field>
+        #            [type] <int> 0
+        #            [code] <int> 5
+        #            [value] <int> XXXXXX
+        #          [4] <Tuple:Field>
+        #            [type] <int> 5
+        #            [code] <int> 1
+        #            [value] <int> 0
+        #      [6] <Tuple:Record>
+        #        [n] <int> 2
+        #        [fields] <list>
+        #          [0] <Tuple:Field>
+        #            [type] <int> 3
+        #            [code] <int> 0
+        #            [value] <str(7)> 'UserName'      // USER NAME
+        #          [1] <Tuple:Field>
+        #            [type] <int> 4
+        #            [code] <int> 1
+        #            [value] <str(29)> '........'
+        #          [2] <Tuple:Field>
+        #            [type] <int> 4
+        #            [code] <int> 6
+        #            [value] <str(260)> '.........'
+        #          [3] <Tuple:Field>
+        #            [type] <int> 5
+        #            [code] <int> 1
+        #            [value] <int> 0
+        #
+
+        block = self.scanner.blocks[block_index]
+
+        user_id_record_index = -2
+        for record_index, record in enumerate(block.block_data):
+            for field_index, field in enumerate(record.fields):
+                # The user ID comes first
+                if field.type == 0 and field.code == 3 and field_index == 1:
+                    user_id = field.value
+                    user_id_record_index = record_index
+                    #print("user_id {} field_index {} record_index {}".format(user_id, field_index, record_index))
+                    continue
+
+                # The user name comes in the record following it
+                if field.type == 3 and field.code == 0 and field_index == 0 and record_index == user_id_record_index + 1:
+                    user_name = field.value
+                    #print("user_name {} field_index {} record_index {} UIRI {}".format(
+                    #    user_name, field_index, record_index, user_id_record_index))
+                    self.user_name_map[user_id] = user_name
+                    user_id_record_index = -2
+                    user_id = None
+                    user_name = None
+
+
+    def parse_blocktype_6_usernames(self, block_index):
+        """Adds the userid of the 1st message and the caller's username to the username map"""
+
+        #      [0] <Tuple:Message>
+        #        [header] <Tuple:MessageHeader>
+        #          [id] <int> XXXXXX
+        #          [x] <int> XXXXX
+        #          [timestamp] <int> XXXXX
+        #          [y] <int> 64
+        #          [data_size] <int> 237
+        #        [records] <list>
+        #          [0] <Tuple:Record>
+        #            [n] <int> 2
+        #            [fields] <list>
+        #              [0] <Tuple:Field>
+        #                [type] <int> 3
+        #                [code] <int> 0
+        #                [value] <str(24)> 'UserName'   /// USERNAME
+        #              [1] <Tuple:Field>
+        #                [type] <int> 5
+        #                [code] <int> 2
+        #                [value] <int> 0
+        #          [1] <Tuple:Record>
+        #            [n] <int> 3
+        #            [fields] <list>
+        #              [0] <Tuple:Field>
+        #                [type] <int> 0
+        #                [code] <int> 2
+        #                [value] <int> 1
+        #              [1] <Tuple:Field>
+        #                [type] <int> 0
+        #                [code] <int> 3
+        #                [value] <int> NNNNNNN     // USER ID
+        #              [2] <Tuple:Field>
+        #                [type] <int> 4
+        #                [code] <int> 4
+        #                [value] <str(190)> '....'
+        #
+
+
+
+        # [0] <Tuple:Message>
+        #   [header] <Tuple:MessageHeader>
+        #     [id] <int> 354454083
+        #     [x] <int> 22549700
+        #     [timestamp] <int> 1352983489
+        #     [y] <int> 64
+        #     [data_size] <int> 220
+        #   [records] <list>
+        #     [0] <Tuple:Record>
+        #       [n] <int> 2
+        #       [fields] <list>
+        #         [0] <Tuple:Field>
+        #           [type] <int> 3
+        #           [code] <int> 0
+        #           [value] <str(15)> 'CallersUserName' // CALLERS USERNAME
+        #         [1] <Tuple:Field>
+        #           [type] <int> 5
+        #           [code] <int> 2
+        #           [value] <int> 0
+        #     [1] <Tuple:Record>
+        #       [n] <int> 3
+        #       [fields] <list>
+        #         [0] <Tuple:Field>
+        #           [type] <int> 0
+        #           [code] <int> 2
+        #           [value] <int> 1
+        #         [1] <Tuple:Field>
+        #           [type] <int> 0
+        #           [code] <int> 3
+        #           [value] <int> MMMMMMMM   // RECIPIENT'S USER ID
+        #         [2] <Tuple:Field>
+        #           [type] <int> 4
+        #           [code] <int> 4
+        #           [value] <str(182)> '..........'
+
+
+
+        # Find the first message with two parts
+        # - there we'll be able to detect the ID of the author of the conversation
+
+        # NOTE: this may not alway be true, see D / chatsync/0a/0a5beb1c1cc7d857.dat
+
         first_valid_block = -1
-        for i, msg in enumerate(self.scanner.blocks[2].block_data):
+        for i, msg in enumerate(self.scanner.blocks[block_index].block_data):
             if len(msg.records) > 1 and len(msg.records[1].fields) > 1:
                 first_valid_block = i
                 break
+
         if first_valid_block == -1:
-            self.is_empty = True
+            #self.is_empty = True
             return
-        user1_id = self.scanner.blocks[2].block_data[first_valid_block].records[1].fields[1].value
-        for msg in self.scanner.blocks[2].block_data:
-            if len(msg.records) < 2: 
+
+        user1_id = self.scanner.blocks[block_index].block_data[first_valid_block].records[1].fields[1].value
+
+        if user1_id not in self.user_name_map:
+            self.user_name_map[user1_id] = self.session['caller']
+            return
+
+        if self.user_name_map[user1_id] == self.session['caller']:
+            return
+
+        raise ScanException("Mismatching user id: {} => {} (message block, session.caller) vs {} (type-2-block)".format(
+            user1_id, self.session['caller'], self.user_name_map[user1_id]))
+
+
+    @staticmethod
+    def blob2message(blob):
+        """Decodes a message blob into text"""
+        try:
+            msg_start = blob.index('\x03\x02')
+            msg_end = blob.index('\x00', msg_start+1)
+            msg_text = blob[msg_start+2:msg_end]
+            is_edit = False
+        except:
+            try:
+                msg_start = blob.index('\x03"')
+                msg_end = blob.index('\x00', msg_start+1)
+                msg_text = blob[msg_start+2:msg_end]
+                is_edit = True
+            except:
+                return None, None
+
+        return msg_text, is_edit
+
+
+    def parse_blocktype_6_messages(self, block_index):
+        """Parses a Type 6 block for messages and appends them to self.conversation."""
+
+        # Note: "first_valid_block / is_empty" check missing
+
+        for msg in self.scanner.blocks[block_index].block_data:
+            if len(msg.records) < 2:
                 continue
             if len(msg.records[1].fields) < 3:
                 continue
-            user_id = msg.records[1].fields[1].value
-            blob = msg.records[1].fields[2].value
+
+            # Get the message's username
+            author_user_id = msg.records[1].fields[1].value
+            author_user_name = "??"
+            if author_user_id in self.user_name_map:
+                author_user_name = self.user_name_map[author_user_id]
+
+            # Debug
+            author_user_name += ":" + str(author_user_id)
+
+            msg_text, is_edit = self.blob2message(msg.records[1].fields[2].value)
+
             try:
-                msg_start = blob.index('\x03\x02')
-                msg_end = blob.index('\x00', msg_start+1)
-                msg_text = blob[msg_start+2:msg_end]
-                is_edit = False
+                self.conversation.append(ConversationMessage(
+                    msg.header.timestamp,
+                    author_user_name,
+                    unicode(msg_text, 'utf-8'),
+                    is_edit)
+                )
             except:
-                try:
-                    msg_start = blob.index('\x03"')
-                    msg_end = blob.index('\x00', msg_start+1)
-                    msg_text = blob[msg_start+2:msg_end]
-                    is_edit = True
-                except:
-                    continue
-            try:
-                self.conversation.append(ConversationMessage(msg.header.timestamp, participant1 if user_id == user1_id else participant2, unicode(msg_text, 'utf-8'), is_edit))
-            except:
+                # FIXME: error reporting
                 self.errors += 1
 
-        self.parse_peers()
-
     def parse_peers(self):
+        """Iterates through self.conversation and appends all usernames found to self.peers"""
+
         peer_set = set()
 
-        for username in self.participants:
+        for username in [self.session['caller'], self.session['recipient']]:
             peer_set.add(username)
 
         for msg in self.conversation:
@@ -417,6 +654,7 @@ class SkypeChatSyncParser(object):
             peer_set.add('__UNKNOWN__')
 
         self.peers = list(peer_set)
+
 
 class AbstractChatHistory(object):
     """Common methods for ThreadedSkypeChatHistory and FlatSkypeChatHistory"""
@@ -447,13 +685,10 @@ class AbstractChatHistory(object):
                 # Only consider *.dat files
                 if filename[-4:] != ".dat":
                     continue
-
                 # Skip OS X's "._*" metadata files
                 if filename[:2] == "._":
                     continue
-
                 # Parse the file
-
                 with open(root + "/" + filename, 'rb') as filehandle:
                     try:
                         scanner = SkypeChatSyncScanner(filehandle)
@@ -461,15 +696,13 @@ class AbstractChatHistory(object):
                     except Exception as e:
                         errors.append("Scan error, skipping: {}: {}".format(root + "/" + filename, e.message))
                         continue
-
                     try:
                         parser = SkypeChatSyncParser(scanner)
                         parser.parse()
                     except Exception as e:
                         errors.append("Parse error, skipping: {}: {}".format(root + "/" + filename, e.message))
                         continue
-
-
+                    #print("Imported file {}".format(root + "/" + filename))
                 # Import it
                 self.append_history(parser)
 
@@ -485,7 +718,7 @@ class AbstractChatHistory(object):
             parser = SkypeChatSyncParser(scanner)
             parser.parse()
 
-            self.append(perser)
+            self.append_history(parser)
 
     def check_username_filter(self, peer_set):
         """Checks peer_set against self.userlist_filter"""
@@ -602,7 +835,7 @@ def parse_chatsync_file(filename):
     '''
     Parses a given chatsync file.
     Throws an exception on any failure (which may happen even if the file is legitimate simply because we do not know all the details of the format).
-    
+
     If succeeds, returns a SkypChatSyncParser object. Check out its "is_empty", "timestamp", "conversation" and "participants" fields.
     '''
     with open(filename, 'rb') as f:
