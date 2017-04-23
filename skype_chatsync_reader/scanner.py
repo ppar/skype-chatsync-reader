@@ -50,7 +50,7 @@ class FileHeader(namedtuple('FileHeader', 'signature timestamp data_size padding
         if self.signature != 'sCdB\x07':
             raise ScanException("Error scanning header in %s. Invalid signature: %s." % (scanner.name, self.signature))
         if self.padding != '\x00'*19:
-            warnings.warn("Header padding not all zeroes in %s." % scanner.name)
+            scanner.warning_list.append("Header padding not all zeroes in %s." % scanner.name)
             scanner.warnings += 1
 
 Block = namedtuple ('Block', 'block_header block_data')
@@ -74,7 +74,7 @@ class BlockHeader(namedtuple('BlockHeader', 'data_size x type padding')):
 
     def validate(self, scanner):
         if self.padding != '\x00'*4:
-            warnings.warn("Block #%d header padding not all zeroes in %s." % (len(scanner.blocks) + 1, scanner.name))
+            scanner.warning_list.append("Block #%d header padding not all zeroes in %s." % (len(scanner.blocks) + 1, scanner.name))
             scanner.warnings += 1
         if self.type < 1 or self.type > 6:
             raise ScanException("Error scanning block #%d in %s. Type field value %d invalid." % (len(scanner.blocks) + 1, scanner.name, self.type))
@@ -122,9 +122,10 @@ class SkypeChatSyncScanner(object):
         """
         self.input = file_like_object
         self.name = name if name is not None else repr(self.input)
+        self.warning_list = []
 
-    def scan(self):
-        """Scans the input file. Only "public" method apart from __init__ ."""
+    def scan(self, validate=True):
+        """Scans the input file."""
 
         # Read in the file's main header
         size, self.file_header = self.scan_struct(FileHeader)
@@ -136,18 +137,20 @@ class SkypeChatSyncScanner(object):
         # Read in each of the file's major blocks
         size, self.blocks = self.scan_sequence(self.scan_block, self.file_header.data_size)
 
-        # Validate the whole thing.
-        self.validate()
+        if validate:
+            # Validate the whole thing.
+            self.validate()
 
     def validate(self):
-        """Validates the whole /self/ object after scanning is complete"""
+        """Tries to validate the whole object by checking for presence of a single type-6 block. NOTE: not 100% correct; some files do not contain these blocks."""
+
         if len(self.blocks) != 6:
-            warnings.warn("Incorrect number of blocks (%d) read from %s." % (len(self.blocks), self.name))
+            self.warning_list.append("Incorrect number of blocks (%d) read from %s." % (len(self.blocks), self.name))
             self.warnings += 1
         else:
             block_ids = [b.block_header.type for b in self.blocks]
             if sorted(block_ids) != range(1, 7):
-                warnings.warn("Not all blocks 1..6 are present in %s." % self.name)
+                self.warning_list.append("Not all blocks 1..6 are present in %s." % self.name)
                 self.warnings += 1
 
         block_6 = [b for b in self.blocks if b.block_header.type == 6]
@@ -170,7 +173,7 @@ class SkypeChatSyncScanner(object):
             if stop_at(item):
                 break
         if remaining < 0:
-            warnings.warn("Invalid data size detected during sequence parsing in %s." % self.name)
+            self.warning_list.append("Invalid data size detected during sequence parsing in %s." % self.name)
             self.warnings += 1
         return nbytes - remaining, items
 
@@ -358,19 +361,27 @@ class SkypeChatSyncParser(object):
     participants[0]         An alias of session.caller
     participants[1]         An alias of session.recipient
 
-    peers                   List containing all participants' userids found in the file
+    peers                   List containing usernames of all participants found in the .dat file
 
+    user_name_map           A dict of [transient numeric userid] => [textual username] mappings
 
     As far as multi-user chats are recognized, .peers contains ids of all users in the chat.
     """
 
     def __init__(self, scanner):
         self.scanner = scanner
+        self.debug_append_username_userids = False
+
+        self.session = {
+            "caller": None,
+            "recipient": None,
+            "connection_id": None
+        }
 
     def parse(self):
         self.timestamp = self.scanner.file_header.timestamp
         self.conversation = []
-        self.errors = 0
+        self.warning_list = []
         self.is_empty = False
         self.user_name_map = {}
 
@@ -380,18 +391,28 @@ class SkypeChatSyncParser(object):
             self.is_empty = True
             return
 
+        #
         # Parse the session id
-        # [value] <str(41)> '#username_1/$username_2;6a2b3ce00f8123ca'
+        #
         self.session_id = self.scanner.blocks[0].block_data[0].fields[0].value
-        matches = re.match('^\#([^/]+)/\$([^;]+);(.*)', self.session_id)
-        if not matches:
-            raise ScanException("Could not parse session id - RE did not match: '{}'".format(self.session_id))
-        self.session = {
-            "caller": matches.group(1),
-            "recipient": matches.group(2),
-            "connection_id": matches.group(3)
-        }
-        self.participants = [self.session['caller'], self.session['recipient']]
+        # [value] <str(41)> '#username_caller/$username_recipient;6a2b3ce00f8123ca'
+        # - Provides the caller's and recipient's usernames and the connection ID
+        matches = re.match('^\#([^/]+)/\$([^;]+);([0-9a-fA-F]+)$', self.session_id)
+        if matches:
+            self.session["caller"] = matches.group(1)
+            self.session["recipient"] = matches.group(2)
+            self.session["connection_id"] = matches.group(3)
+            self.participants = [self.session['caller'], self.session['recipient']]
+
+        else:
+            # '#username/$6ec145419e3abe10'
+            matches = re.match('^\#([^/]+)/\$([0-9a-fA-F]+)$', self.session_id)
+            if matches:
+                self.session["caller"] = matches.group(1)
+                self.session["connection_id"] = matches.group(2)
+                self.participants = [self.session['caller'], None]
+            else:
+                raise ScanException("Could not parse session ID: {}".format(self.session_id))
 
         # Parse all "Type 2" blocks for usernames
         for block_index, block in enumerate(self.scanner.blocks):
@@ -427,7 +448,7 @@ class SkypeChatSyncParser(object):
         #          [2] <Tuple:Field>
         #            [type] <int> 4
         #            [code] <int> 4
-        #            [value] <str(179)> '.........'
+        #            [value] <str(179)> '.........'  // Message text?
         #          [3] <Tuple:Field>
         #            [type] <int> 0
         #            [code] <int> 5
@@ -446,11 +467,11 @@ class SkypeChatSyncParser(object):
         #          [1] <Tuple:Field>
         #            [type] <int> 4
         #            [code] <int> 1
-        #            [value] <str(29)> '........'
+        #            [value] <str(29)> '........'   // Message text?
         #          [2] <Tuple:Field>
         #            [type] <int> 4
         #            [code] <int> 6
-        #            [value] <str(260)> '.........'
+        #            [value] <str(260)> '.........'  // Message text?
         #          [3] <Tuple:Field>
         #            [type] <int> 5
         #            [code] <int> 1
@@ -463,6 +484,7 @@ class SkypeChatSyncParser(object):
         for record_index, record in enumerate(block.block_data):
             for field_index, field in enumerate(record.fields):
                 # The user ID comes first
+                # Assume the magic pair (type=0, code=3) signals the userid
                 if field.type == 0 and field.code == 3 and field_index == 1:
                     user_id = field.value
                     user_id_record_index = record_index
@@ -470,6 +492,7 @@ class SkypeChatSyncParser(object):
                     continue
 
                 # The user name comes in the record following it
+                # Assume the magic pair (type=3, code=0) signals this
                 if field.type == 3 and field.code == 0 and field_index == 0 and record_index == user_id_record_index + 1:
                     user_name = field.value
                     #print("user_name {} field_index {} record_index {} UIRI {}".format(
@@ -481,8 +504,17 @@ class SkypeChatSyncParser(object):
 
 
     def parse_blocktype_6_usernames(self, block_index):
-        """Adds the userid of the 1st message and the caller's username to the username map"""
+        """Tries to parse the caller's numeric userid from the first message.
 
+        Searches for the first message with two parts. Assumemes the numeric userid found
+        therein belongs to the caller and adds it to the userid map.
+
+        NOTE: This is not always true; sometimes this numeric userid belongs to the recipient
+        instead and calling this method results in an incorrect mapping!
+        """
+
+        # Typical / expected case:
+        #
         #      [0] <Tuple:Message>
         #        [header] <Tuple:MessageHeader>
         #          [id] <int> XXXXXX
@@ -519,8 +551,8 @@ class SkypeChatSyncParser(object):
         #                [value] <str(190)> '....'
         #
 
-
-
+        # Exception in D / chatsync/0a/0a5beb1c1cc7d857.dat:
+        #
         # [0] <Tuple:Message>
         #   [header] <Tuple:MessageHeader>
         #     [id] <int> 354454083
@@ -556,13 +588,6 @@ class SkypeChatSyncParser(object):
         #           [code] <int> 4
         #           [value] <str(182)> '..........'
 
-
-
-        # Find the first message with two parts
-        # - there we'll be able to detect the ID of the author of the conversation
-
-        # NOTE: this may not alway be true, see D / chatsync/0a/0a5beb1c1cc7d857.dat
-
         first_valid_block = -1
         for i, msg in enumerate(self.scanner.blocks[block_index].block_data):
             if len(msg.records) > 1 and len(msg.records[1].fields) > 1:
@@ -576,18 +601,22 @@ class SkypeChatSyncParser(object):
         user1_id = self.scanner.blocks[block_index].block_data[first_valid_block].records[1].fields[1].value
 
         if user1_id not in self.user_name_map:
+            # Add the mapping
             self.user_name_map[user1_id] = self.session['caller']
             return
 
         if self.user_name_map[user1_id] == self.session['caller']:
+            # Same mapping already existed
             return
 
-        raise ScanException("Mismatching user id: {} => {} (message block, session.caller) vs {} (type-2-block)".format(
-            user1_id, self.session['caller'], self.user_name_map[user1_id]))
+        # Conflicting mapping already existed
+        msg = "Mismatching user id: {} => {} (message block, session.caller) vs {} (type-2-block)".format(
+            user1_id, self.session['caller'], self.user_name_map[user1_id])
+        #raise ScanException(msg)
+        self.warning_list.append(msg)
+        self.user_name_map[user1_id] = self.user_name_map[user1_id] + "|" + self.session['caller']
 
-
-    @staticmethod
-    def blob2message(blob):
+    def blob2message(self, blob):
         """Decodes a message blob into text"""
         try:
             msg_start = blob.index('\x03\x02')
@@ -605,13 +634,12 @@ class SkypeChatSyncParser(object):
 
         return msg_text, is_edit
 
-
     def parse_blocktype_6_messages(self, block_index):
         """Parses a Type 6 block for messages and appends them to self.conversation."""
 
         # Note: "first_valid_block / is_empty" check missing
 
-        for msg in self.scanner.blocks[block_index].block_data:
+        for block_data_index, msg in enumerate(self.scanner.blocks[block_index].block_data):
             if len(msg.records) < 2:
                 continue
             if len(msg.records[1].fields) < 3:
@@ -619,25 +647,50 @@ class SkypeChatSyncParser(object):
 
             # Get the message's username
             author_user_id = msg.records[1].fields[1].value
-            author_user_name = "??"
             if author_user_id in self.user_name_map:
                 author_user_name = self.user_name_map[author_user_id]
-
-            # Debug
-            author_user_name += ":" + str(author_user_id)
+                if self.debug_append_username_userids:
+                    author_user_name += ":" + str(author_user_id)
+            else:
+                author_user_name = "??:" + str(author_user_id)
 
             msg_text, is_edit = self.blob2message(msg.records[1].fields[2].value)
 
+            ##############
+
+            # ConversationMessage = namedtuple('ConversationMessage', 'timestamp author text is_edit')
+
+            # self.conversation.append(ConversationMessage(
+            #     msg.header.timestamp,
+            #     author_user_name,
+            #     unicode(msg_text, 'utf-8'),
+            #     is_edit)
+            # )
+
+            if msg_text == None:
+                self.warning_list.append("blob2message() failed at blocks[{}].block_data[{}]".format(block_index, block_data_index))
+                msg_text = "<DECODING FAILED>"
+
+            if is_edit == None:
+                is_edit = False
+
             try:
-                self.conversation.append(ConversationMessage(
+                cm = ConversationMessage(
                     msg.header.timestamp,
                     author_user_name,
                     unicode(msg_text, 'utf-8'),
-                    is_edit)
+                    is_edit
                 )
-            except:
-                # FIXME: error reporting
-                self.errors += 1
+
+            except UnicodeDecodeError:
+                cm = ConversationMessage(
+                    msg.header.timestamp,
+                    author_user_name,
+                    unicode("<UNICODE ERROR>", 'utf-8'),
+                    is_edit
+                )
+
+            self.conversation.append(cm)
 
     def parse_peers(self):
         """Iterates through self.conversation and appends all usernames found to self.peers"""
@@ -649,6 +702,9 @@ class SkypeChatSyncParser(object):
 
         for msg in self.conversation:
             peer_set.add(msg.author)
+
+        if None in peer_set:
+            peer_set.remove(None)
 
         if len(peer_set) == 0:
             peer_set.add('__UNKNOWN__')
@@ -672,53 +728,6 @@ class AbstractChatHistory(object):
         self.username_filter = username_filter
         self.timestamp_from  = timestamp_from
         self.timestamp_to    = timestamp_to
-
-    def import_directory(self, srcdir):
-        """Scans directory srcdir recursively for .dat files and imports their contents."""
-
-        errors = []
-
-        # Iterate directories
-        for root, dirs, files in os.walk(srcdir):
-            # Iterate files in directory
-            for filename in files:
-                # Only consider *.dat files
-                if filename[-4:] != ".dat":
-                    continue
-                # Skip OS X's "._*" metadata files
-                if filename[:2] == "._":
-                    continue
-                # Parse the file
-                with open(root + "/" + filename, 'rb') as filehandle:
-                    try:
-                        scanner = SkypeChatSyncScanner(filehandle)
-                        scanner.scan()
-                    except Exception as e:
-                        errors.append("Scan error, skipping: {}: {}".format(root + "/" + filename, e.message))
-                        continue
-                    try:
-                        parser = SkypeChatSyncParser(scanner)
-                        parser.parse()
-                    except Exception as e:
-                        errors.append("Parse error, skipping: {}: {}".format(root + "/" + filename, e.message))
-                        continue
-                    #print("Imported file {}".format(root + "/" + filename))
-                # Import it
-                self.append_history(parser)
-
-        return errors
-
-    def import_file(self, filename):
-        """Imports a single file. Raises exceptions if things fail."""
-
-        with open(filename, 'rb') as filehandle:
-            scanner = SkypeChatSyncScanner(filehandle)
-            scanner.scan()
-
-            parser = SkypeChatSyncParser(scanner)
-            parser.parse()
-
-            self.append_history(parser)
 
     def check_username_filter(self, peer_set):
         """Checks peer_set against self.userlist_filter"""
@@ -830,6 +839,25 @@ class FlatSkypeChatHistory(AbstractChatHistory):
         """Sorts messages according to timestamp"""
         self.messages = sorted(self.messages, key = lambda ts: ts.timestamp)
 
+def walk_dat_files(srcpath):
+        """Generator method that retuns all .dat files under srcpath. The argument may point to a directory or a single .dat file"""
+
+        if not os.path.isdir(srcpath):
+            yield srcpath
+            return
+
+        for root, dirs, files in os.walk(srcpath):
+            # Iterate files in directory
+            for filename in files:
+                # Only consider *.dat files
+                if filename[-4:] != ".dat":
+                    continue
+
+                # Skip OS X's "._*" metadata files
+                if filename[:2] == "._":
+                    continue
+
+                yield root + "/" + filename
 
 def parse_chatsync_file(filename):
     '''
@@ -859,3 +887,4 @@ def parse_chatsync_profile_dir(dirname):
         except Exception, e:
             warnings.warn("Failed to parse file %s. Exception: %s" % (f, e.message))
     return results
+

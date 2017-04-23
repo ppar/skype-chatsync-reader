@@ -51,6 +51,18 @@ def dump_var(var, level = 0, _var_index = None):
                 dump_var(v, level = level + 1)
             return
 
+    # Special case for SkypeChatSyncScanner's "Field" tuples
+    if isinstance(var, tuple) and type(var).__name__ == "Field":
+        lst = []
+        for i, v in var._asdict().iteritems():
+            lst.append("[{}]: {}".format(i, repr(v)))
+
+        varstring = (level * PAD) + index_str + "<Tuple:" + type(var).__name__ + ">" + ", ".join(lst)
+        if len(varstring) > MAX_WIDTH:
+            varstring = varstring[:MAX_WIDTH-3] + "..."
+        print(varstring)
+        return
+
     # Recurse - sequences - tuples
     if isinstance(var, tuple):
         #print(repr(var))
@@ -80,9 +92,12 @@ def dump_var(var, level = 0, _var_index = None):
     # Recurse - objects
     if isinstance(var, object):
         print((level * PAD) + index_str + "<Object:" + type(var).__name__ + ">")
-
-        for i, v in var.__dict__.iteritems():
-            dump_var(v, level = level + 1, _var_index = i)
+        try:
+            for i, v in var.__dict__.iteritems():
+                dump_var(v, level = level + 1, _var_index = i)
+        except AttributeError:
+            # FIXME
+            dump_var(repr(var), level = level + 1)
         return
 
     # ???
